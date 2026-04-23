@@ -18,7 +18,7 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
   - `×` button to delete individual entries
   - **Clear all** to wipe history
 - Response viewer with three tabs: **Body**, **Response Headers**, **Parsed Request**
-  - **Parsed Request** tab shows exactly what was sent — method, URL, headers, auth, cookies, proxy, timeouts, and any flags that were silently ignored
+  - **Parsed Request** tab shows exactly what was sent — method, URL, headers, auth, cookies, cookie-jar path, proxy, timeouts, and any flags that were silently ignored
 - **Find bar** — search text inside any response tab (Ctrl+F, ◀ ▶ navigation, match counter)
 - Right-click context menu (Cut / Copy / Paste / Select All)
 - Keyboard shortcuts:

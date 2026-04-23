@@ -1165,6 +1165,7 @@ class CurlApp:
                 'form':    parsed['form'] or None,
                 'auth':    f"{parsed['auth'][0]}:***" if parsed.get('auth') else None,
                 'cookies': parsed['cookies'] or None,
+                'cookie_jar': parsed.get('cookie_jar'),
                 'proxy':   parsed.get('proxy'),
                 'timeout': {
                     'connect_s': parsed.get('timeout_connect'),
