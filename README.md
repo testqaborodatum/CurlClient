@@ -18,17 +18,40 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
   - `×` button to delete individual entries
   - **Clear all** to wipe history
 - Response viewer with three tabs: **Body**, **Response Headers**, **Parsed Request**
+- **Find bar** — search text inside any response tab (Ctrl+F, ◀ ▶ navigation, match counter)
 - Right-click context menu (Cut / Copy / Paste / Select All)
 - Keyboard shortcuts:
   | Shortcut | Action |
   |---|---|
-  | `Ctrl/Cmd + Enter` | Send request |
-  | `Ctrl/Cmd + A` | Select all |
-  | `Ctrl/Cmd + C` | Copy |
-  | `Ctrl/Cmd + V` | Paste |
-  | `Ctrl/Cmd + X` | Cut |
-  | `Ctrl/Cmd + Z` | Undo |
-  | `Ctrl/Cmd + Y` / `Cmd+Shift+Z` | Redo |
+  | `Ctrl + Enter` | Send request |
+  | `Ctrl + F` | Focus find bar |
+  | `Ctrl + A` | Select all |
+  | `Ctrl + C` | Copy |
+  | `Ctrl + V` | Paste |
+  | `Ctrl + X` | Cut |
+  | `Ctrl + Z / Y` | Undo / Redo |
+
+---
+
+## Supported curl options
+
+| Option | Description |
+|---|---|
+| `-H / --header` | Custom request headers |
+| `-X / --request` | HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD) |
+| `-d / --data` | Raw request body (`--data-raw`, `--data-binary`, etc.) |
+| `-F / --form` | Multipart form-data fields; `@path` uploads a file |
+| `-u / --user` | Basic auth (`user:password`) |
+| `-b / --cookie` | Send cookies (`"name=value; name2=value2"`) |
+| `-c / --cookie-jar` | Save response cookies to a file |
+| `-L / --location` | Follow redirects (off by default, matching curl) |
+| `-k / --insecure` | Skip SSL certificate verification |
+| `--compressed` | Request gzip/deflate/br encoding |
+| `--proxy / -x` | HTTP/HTTPS/SOCKS proxy URL |
+| `--max-time / -m` | Total request timeout in seconds |
+| `--connect-timeout` | Connection timeout in seconds |
+| `-I / --head` | HEAD request |
+| `-G / --get` | Force GET method |
 
 ---
 
@@ -36,16 +59,18 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
 
 **Windows (CMD)**
 ```
-curl ^"https://api.example.com/data^" ^
-  -H ^"accept: application/json^" ^
-  -H ^"authorization: Bearer TOKEN^"
+curl "https://api.example.com/data" ^
+  -H "accept: application/json" ^
+  -H "authorization: Bearer TOKEN" ^
+  -d "{\"key\": \"value\"}"
 ```
 
 **Mac / Linux**
 ```bash
 curl 'https://api.example.com/data' \
   -H 'accept: application/json' \
-  -H 'authorization: Bearer TOKEN'
+  -H 'authorization: Bearer TOKEN' \
+  -d '{"key": "value"}'
 ```
 
 ---
@@ -63,7 +88,7 @@ python curl_client.py
 
 ```bash
 pip install requests pyinstaller
-pyinstaller --onefile --windowed --name "CurlClient" curl_client.py
+pyinstaller --onefile --windowed --name CurlClient --clean curl_client.py
 # Output: dist/CurlClient.exe
 ```
 
@@ -82,4 +107,4 @@ bash build_mac.sh
 
 - Python 3.10+
 - `requests` library (`pip install requests`)
-- `tkinter` (included with standard Python on Windows; on macOS install via `brew install python-tk`)
+- `tkinter` (included with standard Python on Windows; on macOS: `brew install python-tk`)

@@ -64,15 +64,21 @@ def parse_curl(raw: str) -> dict:
         'headers': {},
         'data': None,
         'form': {},
-        'allow_redirects': True,
+        'allow_redirects': False,  # curl default: no redirects unless -L
         'verify': True,
+        'cookies': {},
+        'cookie_jar': None,
+        'auth': None,
+        'proxy': None,
+        'timeout_connect': None,
+        'timeout_total': None,
+        'compressed': False,
     }
 
     SKIP_WITH_VALUE = {
-        '--connect-timeout', '--max-time', '-m', '--limit-rate',
-        '-o', '--output', '-u', '--user', '-A', '--user-agent',
-        '--url', '-e', '--referer', '--proxy', '-x',
-        '-b', '--cookie', '-c', '--cookie-jar',
+        '--limit-rate',
+        '-o', '--output', '-A', '--user-agent',
+        '--url', '-e', '--referer',
         '--cert', '--key', '--cacert', '--capath',
         '--dns-servers', '--resolve', '--interface',
         '-T', '--upload-file', '--retry', '--retry-delay',
@@ -81,7 +87,7 @@ def parse_curl(raw: str) -> dict:
 
     SKIP_FLAG = {
         '-s', '-S', '--silent', '--show-error', '-v', '--verbose',
-        '-i', '--include', '--compressed', '--http1.0', '--http1.1',
+        '-i', '--include', '--http1.0', '--http1.1',
         '--http2', '--http2-prior-knowledge', '--no-keepalive',
         '-4', '--ipv4', '-6', '--ipv6', '-n', '--netrc',
         '--no-buffer', '-N',
@@ -135,6 +141,60 @@ def parse_curl(raw: str) -> dict:
         elif tok in ('-L', '--location', '--location-trusted'):
             result['allow_redirects'] = True
             i += 1
+        elif tok in ('-u', '--user'):
+            if i + 1 < len(tokens):
+                creds = tokens[i + 1]
+                colon = creds.find(':')
+                if colon != -1:
+                    result['auth'] = (creds[:colon], creds[colon + 1:])
+                else:
+                    result['auth'] = (creds, '')
+                i += 2
+            else:
+                i += 1
+        elif tok in ('-b', '--cookie'):
+            if i + 1 < len(tokens):
+                for part in tokens[i + 1].split(';'):
+                    part = part.strip()
+                    eq = part.find('=')
+                    if eq != -1:
+                        result['cookies'][part[:eq].strip()] = part[eq + 1:].strip()
+                i += 2
+            else:
+                i += 1
+        elif tok in ('-c', '--cookie-jar'):
+            if i + 1 < len(tokens):
+                result['cookie_jar'] = tokens[i + 1]
+                i += 2
+            else:
+                i += 1
+        elif tok in ('--proxy', '-x'):
+            if i + 1 < len(tokens):
+                result['proxy'] = tokens[i + 1]
+                i += 2
+            else:
+                i += 1
+        elif tok == '--connect-timeout':
+            if i + 1 < len(tokens):
+                try:
+                    result['timeout_connect'] = float(tokens[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+        elif tok in ('--max-time', '-m'):
+            if i + 1 < len(tokens):
+                try:
+                    result['timeout_total'] = float(tokens[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+        elif tok == '--compressed':
+            result['compressed'] = True
+            i += 1
         elif tok in ('-k', '--insecure'):
             result['verify'] = False
             i += 1
@@ -170,21 +230,58 @@ def execute_request(parsed: dict) -> dict:
         raise ValueError("No URL found in curl command")
 
     session = requests.Session()
+
+    # Timeout: (connect, read) tuple; defaults to 30s each
+    tc = parsed.get('timeout_connect') or 30
+    tt = parsed.get('timeout_total') or 30
+    timeout = (tc, tt)
+
+    headers = dict(parsed['headers'])
+    if parsed.get('compressed') and 'Accept-Encoding' not in headers:
+        headers['Accept-Encoding'] = 'gzip, deflate, br'
+
     kwargs = {
-        'headers': parsed['headers'],
+        'headers': headers,
         'allow_redirects': parsed['allow_redirects'],
         'verify': parsed['verify'],
-        'timeout': 30,
+        'timeout': timeout,
     }
+
+    if parsed.get('auth'):
+        kwargs['auth'] = parsed['auth']
+
+    if parsed.get('cookies'):
+        kwargs['cookies'] = parsed['cookies']
+
+    if parsed.get('proxy'):
+        kwargs['proxies'] = {'http': parsed['proxy'], 'https': parsed['proxy']}
 
     if parsed['data'] is not None:
         kwargs['data'] = parsed['data'].encode('utf-8') if isinstance(parsed['data'], str) else parsed['data']
     elif parsed['form']:
-        kwargs['data'] = parsed['form']
+        # -F always sends multipart/form-data; @path uploads a file
+        files = {}
+        for k, v in parsed['form'].items():
+            if isinstance(v, str) and v.startswith('@'):
+                filepath = v[1:]
+                try:
+                    files[k] = (os.path.basename(filepath), open(filepath, 'rb'))
+                except OSError:
+                    files[k] = (None, v)
+            else:
+                files[k] = (None, v)
+        kwargs['files'] = files
 
     start = time.time()
     resp = session.request(parsed['method'], parsed['url'], **kwargs)
     elapsed = time.time() - start
+
+    if parsed.get('cookie_jar'):
+        try:
+            with open(parsed['cookie_jar'], 'w', encoding='utf-8') as f:
+                json.dump(dict(resp.cookies), f, indent=2)
+        except Exception:
+            pass
 
     content_type = resp.headers.get('content-type', '')
     try:
@@ -424,24 +521,30 @@ class CurlApp:
 
         s.configure('Send.TButton',
                     background=ACCENT, foreground='#1e1e2e',
-                    font=FONT_UI_B, padding=(16, 8), relief='flat')
+                    font=FONT_UI_B, padding=(16, 8), relief='flat',
+                    focuscolor=ACCENT)
         s.map('Send.TButton',
-              background=[('active', '#b4befe'), ('pressed', '#7287fd'), ('disabled', '#45475a')])
+              background=[('active', '#b4befe'), ('pressed', '#7287fd'), ('disabled', '#45475a')],
+              focuscolor=[('disabled', '#45475a'), ('pressed', '#7287fd'),
+                          ('active', '#b4befe'), ('!focus', ACCENT)])
 
         s.configure('Clear.TButton',
                     background='#45475a', foreground=TEXT,
-                    font=FONT_UI, padding=(12, 8), relief='flat')
+                    font=FONT_UI, padding=(12, 8), relief='flat',
+                    focuscolor='#45475a')
         s.map('Clear.TButton',
-              background=[('active', '#585b70'), ('pressed', '#313244')])
+              background=[('active', '#585b70'), ('pressed', '#313244')],
+              focuscolor=[('pressed', '#313244'), ('active', '#585b70'), ('!focus', '#45475a')])
 
         s.configure('TNotebook',     background=BG, borderwidth=0)
         s.configure('TNotebook.Tab', background=BG, foreground=SUBTEXT,
-                    padding=(10, 4), font=FONT_SM)
+                    padding=(10, 4), font=FONT_SM, focuscolor=BG)
         s.map('TNotebook.Tab',
               background=[('selected', ACCENT)],
               foreground=[('selected', '#1e1e2e')],
               padding=[('selected', (16, 9))],
-              font=[('selected', FONT_UI_B)])
+              font=[('selected', FONT_UI_B)],
+              focuscolor=[('selected', ACCENT), ('!selected', BG)])
 
         s.configure('TScrollbar',
                     background='#313244', troughcolor=INPUT_BG,
@@ -596,18 +699,133 @@ class CurlApp:
         resp_outer = tk.Frame(content, bg=PANEL)
         resp_outer.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(resp_outer, text="Response", bg=PANEL, fg=ACCENT, font=FONT_H).pack(
-            anchor=tk.W, padx=12, pady=(10, 4))
+        resp_hdr = tk.Frame(resp_outer, bg=PANEL)
+        resp_hdr.pack(fill=tk.X, padx=12, pady=(10, 4))
+        tk.Label(resp_hdr, text="Response", bg=PANEL, fg=ACCENT, font=FONT_H).pack(side=tk.LEFT)
 
-        notebook = ttk.Notebook(resp_outer)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
+        # Search bar
+        self._search_matches: list = []
+        self._search_idx: int = 0
 
-        self.body_text    = self._make_tab(notebook, 'Body')
-        self.headers_text = self._make_tab(notebook, 'Response Headers')
-        self.req_text     = self._make_tab(notebook, 'Parsed Request')
+        search_frame = tk.Frame(resp_hdr, bg=PANEL)
+        search_frame.pack(side=tk.RIGHT)
+
+        tk.Label(search_frame, text="Find:", bg=PANEL, fg=SUBTEXT, font=FONT_SM).pack(
+            side=tk.LEFT, padx=(0, 4))
+
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add('write', lambda *_: self._search_update())
+        self._search_entry = tk.Entry(
+            search_frame, textvariable=self._search_var,
+            bg=INPUT_BG, fg=TEXT, insertbackground=ACCENT,
+            font=FONT_SM, relief=tk.FLAT, width=22,
+            selectbackground=ACCENT, selectforeground='#1e1e2e',
+        )
+        self._search_entry.pack(side=tk.LEFT, ipady=4, padx=(0, 4))
+
+        for symbol, cmd in (('◀', '_search_prev'), ('▶', '_search_next')):
+            btn = tk.Label(search_frame, text=symbol, bg=PANEL, fg=SUBTEXT,
+                           font=FONT_SM, cursor='hand2')
+            btn.pack(side=tk.LEFT, padx=1)
+            btn.bind('<Button-1>', lambda _e, m=cmd: getattr(self, m)())
+            btn.bind('<Enter>', lambda e, w=btn: w.config(fg=ACCENT))
+            btn.bind('<Leave>', lambda e, w=btn: w.config(fg=SUBTEXT))
+
+        self._search_count_lbl = tk.Label(search_frame, text="", bg=PANEL,
+                                          fg=SUBTEXT, font=FONT_SM, width=8, anchor='w')
+        self._search_count_lbl.pack(side=tk.LEFT, padx=(4, 0))
+
+        self._notebook = ttk.Notebook(resp_outer)
+        self._notebook.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
+        self._notebook.bind('<<NotebookTabChanged>>', lambda _e: self._search_update())
+
+        self.body_text    = self._make_tab(self._notebook, 'Body')
+        self.headers_text = self._make_tab(self._notebook, 'Response Headers')
+        self.req_text     = self._make_tab(self._notebook, 'Parsed Request')
 
         for widget in (self.body_text, self.headers_text, self.req_text):
             self._bind_readonly_keys(widget)
+
+        # Ctrl+F focuses search entry
+        for seq in ('<Control-f>', '<Control-F>'):
+            self.root.bind(seq, lambda _e: self._search_entry.focus_set())
+
+    # ------------------------------------------------------------------
+    # Search in response
+    # ------------------------------------------------------------------
+
+    def _active_tab_widget(self):
+        try:
+            idx = self._notebook.index(self._notebook.select())
+            return (self.body_text, self.headers_text, self.req_text)[idx]
+        except Exception:
+            return self.body_text
+
+    def _search_clear_tags(self, widget):
+        widget.config(state=tk.NORMAL)
+        widget.tag_remove('search_match',   '1.0', tk.END)
+        widget.tag_remove('search_current', '1.0', tk.END)
+        widget.config(state=tk.DISABLED)
+
+    def _search_update(self):
+        term = self._search_var.get()
+        self._search_matches = []
+        self._search_idx = 0
+
+        for w in (self.body_text, self.headers_text, self.req_text):
+            self._search_clear_tags(w)
+
+        if not term:
+            self._search_count_lbl.config(text='')
+            return
+
+        widget = self._active_tab_widget()
+        widget.config(state=tk.NORMAL)
+        widget.tag_config('search_match',   background='#f9e2af', foreground='#1e1e2e')
+        widget.tag_config('search_current', background=ACCENT,    foreground='#1e1e2e')
+
+        start = '1.0'
+        while True:
+            pos = widget.search(term, start, tk.END, nocase=True)
+            if not pos:
+                break
+            end = f'{pos}+{len(term)}c'
+            widget.tag_add('search_match', pos, end)
+            self._search_matches.append(pos)
+            start = end
+
+        widget.config(state=tk.DISABLED)
+
+        if self._search_matches:
+            self._search_count_lbl.config(text=f'1/{len(self._search_matches)}')
+            self._search_jump(0)
+        else:
+            self._search_count_lbl.config(text='No match')
+
+    def _search_jump(self, idx: int):
+        widget = self._active_tab_widget()
+        if not self._search_matches:
+            return
+        term = self._search_var.get()
+        widget.config(state=tk.NORMAL)
+        widget.tag_remove('search_current', '1.0', tk.END)
+        pos = self._search_matches[idx]
+        widget.tag_add('search_current', pos, f'{pos}+{len(term)}c')
+        widget.see(pos)
+        widget.config(state=tk.DISABLED)
+        self._search_count_lbl.config(text=f'{idx + 1}/{len(self._search_matches)}')
+
+    def _search_next(self):
+        if not self._search_matches:
+            return
+        self._search_idx = (self._search_idx + 1) % len(self._search_matches)
+        self._search_jump(self._search_idx)
+
+    def _search_prev(self):
+        if not self._search_matches:
+            return
+        self._search_idx = (self._search_idx - 1) % len(self._search_matches)
+        self._search_jump(self._search_idx)
 
     def _make_tab(self, notebook: ttk.Notebook, title: str) -> scrolledtext.ScrolledText:
         frame = tk.Frame(notebook, bg=INPUT_BG)
@@ -930,13 +1148,24 @@ class CurlApp:
         try:
             parsed = parse_curl(curl_text)
 
-            req_display = json.dumps({
+            req_info = {
                 'method':  parsed['method'],
                 'url':     parsed['url'],
                 'headers': parsed['headers'],
                 'data':    parsed['data'],
                 'form':    parsed['form'] or None,
-            }, indent=2, ensure_ascii=False)
+                'auth':    f"{parsed['auth'][0]}:***" if parsed.get('auth') else None,
+                'cookies': parsed['cookies'] or None,
+                'proxy':   parsed.get('proxy'),
+                'timeout': {
+                    'connect_s': parsed.get('timeout_connect'),
+                    'total_s':   parsed.get('timeout_total'),
+                } if parsed.get('timeout_connect') or parsed.get('timeout_total') else None,
+                'allow_redirects': parsed['allow_redirects'],
+                'verify':    parsed['verify'],
+                'compressed': parsed.get('compressed', False),
+            }
+            req_display = json.dumps(req_info, indent=2, ensure_ascii=False)
             self.root.after(0, lambda: self._set_text(self.req_text, req_display))
 
             resp = execute_request(parsed)
@@ -951,7 +1180,14 @@ class CurlApp:
             self.root.after(0, lambda: self._show_error(f"Connection Error:\n{e}"))
         except requests.exceptions.Timeout:
             self._save_error_history(curl_text)
-            self.root.after(0, lambda: self._show_error("Request timed out (30s)"))
+            try:
+                p = parse_curl(curl_text)
+                tt = p.get('timeout_total') or 30
+                tc = p.get('timeout_connect') or 30
+                tmsg = f"total={tt}s, connect={tc}s"
+            except Exception:
+                tmsg = "30s"
+            self.root.after(0, lambda: self._show_error(f"Request timed out ({tmsg})"))
         except Exception as e:
             self._save_error_history(curl_text)
             self.root.after(0, lambda: self._show_error(str(e)))
@@ -964,6 +1200,8 @@ class CurlApp:
         self._add_to_history(curl_text, parsed, None)
 
     def _show_response(self, resp: dict):
+        self._search_var.set('')
+
         code = resp['status_code']
         color = GREEN if 200 <= code < 300 else (YELLOW if 300 <= code < 400 else RED)
 
@@ -989,6 +1227,7 @@ class CurlApp:
         self.send_btn.config(state=tk.NORMAL)
 
     def _show_error(self, msg: str):
+        self._search_var.set('')
         self._set_status(f"Error: {msg.splitlines()[0]}", RED)
         self._set_text(self.body_text, f"Error:\n\n{msg}")
         self.send_btn.config(state=tk.NORMAL)
