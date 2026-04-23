@@ -73,6 +73,7 @@ def parse_curl(raw: str) -> dict:
         'timeout_connect': None,
         'timeout_total': None,
         'compressed': False,
+        'ignored': [],
     }
 
     SKIP_WITH_VALUE = {
@@ -202,16 +203,24 @@ def parse_curl(raw: str) -> dict:
             result['method'] = 'HEAD'
             i += 1
         elif tok in SKIP_FLAG:
+            result['ignored'].append(tok)
             i += 1
         elif tok in SKIP_WITH_VALUE:
-            i += 2
+            if i + 1 < len(tokens):
+                result['ignored'].append(f'{tok} {tokens[i + 1]}')
+                i += 2
+            else:
+                result['ignored'].append(tok)
+                i += 1
         elif tok.startswith('http://') or tok.startswith('https://'):
             result['url'] = tok
             i += 1
         elif tok.startswith('--') or (tok.startswith('-') and len(tok) == 2):
             if i + 1 < len(tokens) and not tokens[i + 1].startswith('-'):
+                result['ignored'].append(f'{tok} {tokens[i + 1]}')
                 i += 2
             else:
+                result['ignored'].append(tok)
                 i += 1
         else:
             if result['url'] is None:
@@ -1164,6 +1173,7 @@ class CurlApp:
                 'allow_redirects': parsed['allow_redirects'],
                 'verify':    parsed['verify'],
                 'compressed': parsed.get('compressed', False),
+                'ignored_flags': parsed['ignored'] or None,
             }
             req_display = json.dumps(req_info, indent=2, ensure_ascii=False)
             self.root.after(0, lambda: self._set_text(self.req_text, req_display))

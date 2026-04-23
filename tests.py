@@ -1109,7 +1109,95 @@ class TestEdgeCases(unittest.TestCase):
 
 
 # ===========================================================================
-# 18. Search UI — FakeTextWidget simulation
+# 18. Ignored flags tracking
+# ===========================================================================
+
+class TestIgnoredFlags(unittest.TestCase):
+
+    def test_no_ignored_by_default(self):
+        p = parse_curl('curl https://example.com')
+        self.assertEqual(p['ignored'], [])
+
+    def test_skip_flag_recorded(self):
+        p = parse_curl('curl -s https://example.com')
+        self.assertIn('-s', p['ignored'])
+
+    def test_verbose_flag_recorded(self):
+        p = parse_curl('curl -v https://example.com')
+        self.assertIn('-v', p['ignored'])
+
+    def test_http2_flag_recorded(self):
+        p = parse_curl('curl --http2 https://example.com')
+        self.assertIn('--http2', p['ignored'])
+
+    def test_skip_with_value_recorded_with_value(self):
+        p = parse_curl('curl -o /tmp/out.txt https://example.com')
+        self.assertIn('-o /tmp/out.txt', p['ignored'])
+
+    def test_user_agent_recorded_with_value(self):
+        p = parse_curl('curl -A "MyAgent/1.0" https://example.com')
+        self.assertIn('-A MyAgent/1.0', p['ignored'])
+
+    def test_cert_recorded_with_value(self):
+        p = parse_curl('curl --cert /path/to/cert.pem https://example.com')
+        self.assertIn('--cert /path/to/cert.pem', p['ignored'])
+
+    def test_multiple_skip_flags_all_recorded(self):
+        p = parse_curl('curl -s -v -i https://example.com')
+        self.assertIn('-s', p['ignored'])
+        self.assertIn('-v', p['ignored'])
+        self.assertIn('-i', p['ignored'])
+
+    def test_unknown_flag_recorded(self):
+        p = parse_curl('curl --some-unknown-flag https://example.com')
+        self.assertTrue(any('--some-unknown-flag' in f for f in p['ignored']))
+
+    def test_unknown_flag_with_value_recorded(self):
+        p = parse_curl('curl --future-option somevalue https://example.com')
+        self.assertTrue(any('--future-option somevalue' in f for f in p['ignored']))
+
+    def test_known_flags_not_in_ignored(self):
+        p = parse_curl(
+            'curl -X POST -H "Content-Type: application/json" '
+            '-d "{}" -u user:pass -L -k --compressed https://example.com'
+        )
+        self.assertEqual(p['ignored'], [])
+
+    def test_mixed_known_and_unknown(self):
+        p = parse_curl('curl -v -L -s https://example.com')
+        self.assertIn('-v', p['ignored'])
+        self.assertIn('-s', p['ignored'])
+        self.assertNotIn('-L', p['ignored'])
+
+    def test_retry_recorded_with_value(self):
+        p = parse_curl('curl --retry 3 https://example.com')
+        self.assertIn('--retry 3', p['ignored'])
+
+    def test_write_out_recorded_with_value(self):
+        p = parse_curl('curl -w "%{http_code}" https://example.com')
+        self.assertTrue(any('-w' in f for f in p['ignored']))
+
+    def test_order_preserved(self):
+        p = parse_curl('curl -s -v -i https://example.com')
+        self.assertEqual(p['ignored'], ['-s', '-v', '-i'])
+
+    def test_real_world_devtools_command(self):
+        raw = (
+            'curl "https://api.example.com/data" '
+            '-H "accept: application/json" '
+            '-v -s --compressed -L '
+            '--cert /etc/ssl/client.pem'
+        )
+        p = parse_curl(raw)
+        self.assertIn('-v', p['ignored'])
+        self.assertIn('-s', p['ignored'])
+        self.assertNotIn('--compressed', p['ignored'])
+        self.assertNotIn('-L', p['ignored'])
+        self.assertTrue(any('--cert' in f for f in p['ignored']))
+
+
+# ===========================================================================
+# 20. Search UI — FakeTextWidget simulation
 # ===========================================================================
 
 class FakeTextWidget:

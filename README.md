@@ -18,6 +18,7 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
   - `×` button to delete individual entries
   - **Clear all** to wipe history
 - Response viewer with three tabs: **Body**, **Response Headers**, **Parsed Request**
+  - **Parsed Request** tab shows exactly what was sent — method, URL, headers, auth, cookies, proxy, timeouts, and any flags that were silently ignored
 - **Find bar** — search text inside any response tab (Ctrl+F, ◀ ▶ navigation, match counter)
 - Right-click context menu (Cut / Copy / Paste / Select All)
 - Keyboard shortcuts:
@@ -52,6 +53,8 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
 | `--connect-timeout` | Connection timeout in seconds |
 | `-I / --head` | HEAD request |
 | `-G / --get` | Force GET method |
+
+Options not in the table above (e.g. `--cert`, `-A`, `--retry`, `--http2`, `-v`) are parsed but not acted upon. They appear in the **Parsed Request** tab under `ignored_flags` so you always know what was skipped.
 
 ---
 
