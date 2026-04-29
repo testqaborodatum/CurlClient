@@ -40,7 +40,8 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
 |---|---|
 | `-H / --header` | Custom request headers |
 | `-X / --request` | HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD) |
-| `-d / --data` | Raw request body (`--data-raw`, `--data-binary`, etc.) |
+| `-d / --data` | Raw request body (`--data-raw`, `--data-binary`, `--data-ascii`) |
+| `--data-urlencode` | Request body with value percent-encoded (`name=value` or bare `value`) |
 | `-F / --form` | Multipart form-data fields; `@path` uploads a file |
 | `-u / --user` | Basic auth (`user:password`) |
 | `-b / --cookie` | Send cookies (`"name=value; name2=value2"`) |

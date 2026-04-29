@@ -13,6 +13,8 @@ import unittest
 from io import BytesIO
 from unittest.mock import MagicMock, patch, call
 
+import requests
+
 # curl_client uses tkinter at import time only for the app class; we mock it
 # so the tests run headless.
 sys.modules.setdefault('tkinter', MagicMock())
@@ -651,6 +653,8 @@ class TestExecuteRequest(unittest.TestCase):
             resp = _make_response()
         mock_session = MagicMock()
         mock_session.request.return_value = resp
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
         patcher = patch('curl_client.requests.Session', return_value=mock_session)
         return patcher, mock_session
 
@@ -873,6 +877,17 @@ class TestExecuteRequest(unittest.TestCase):
         args, _ = session.request.call_args
         self.assertEqual(args[0], 'POST')
 
+    def test_data_takes_priority_over_form_in_execute(self):
+        patcher, session = self._mock_session()
+        with patcher:
+            parsed = parse_curl('curl https://example.com')
+            parsed['data'] = 'raw=1'
+            parsed['form'] = {'field': 'value'}
+            execute_request(parsed)
+        _, kwargs = session.request.call_args
+        self.assertIn('data', kwargs)
+        self.assertNotIn('files', kwargs)
+
     # --- multipart form ---
 
     def test_form_data_uses_files_kwarg(self):
@@ -949,12 +964,24 @@ class TestExecuteRequest(unittest.TestCase):
         self.assertEqual(result['status_code'], 404)
         self.assertEqual(result['status_text'], 'Not Found')
 
-    def test_elapsed_ms_is_non_negative(self):
-        patcher, session = self._mock_session()
+    def test_elapsed_ms_is_integer_milliseconds(self):
+        body = b'hello'
+        resp = _make_response(body=body)
+        patcher, session = self._mock_session(resp)
         with patcher:
             parsed = parse_curl('curl https://example.com')
             result = execute_request(parsed)
+        self.assertIsInstance(result['elapsed_ms'], int)
         self.assertGreaterEqual(result['elapsed_ms'], 0)
+
+    def test_resp_text_exception_falls_back_to_content_decode(self):
+        resp = _make_response(body=b'\xff\xfe')
+        type(resp).text = property(lambda self: (_ for _ in ()).throw(Exception('decode error')))
+        patcher, session = self._mock_session(resp)
+        with patcher:
+            parsed = parse_curl('curl https://example.com')
+            result = execute_request(parsed)
+        self.assertIn(result['body'], ['\xff\xfe', '��', resp.content.decode('utf-8', errors='replace')])
 
     def test_size_matches_content_length(self):
         body = b'x' * 1024
@@ -993,8 +1020,8 @@ class TestHistory(unittest.TestCase):
             'method': 'GET',
             'url': f'https://example.com/{n}',
             'curl': f'curl https://example.com/{n}',
-            'status': 200,
-            'ts': time.time(),
+            'status_code': 200,
+            'timestamp': time.time(),
         }
 
     def test_save_and_load_roundtrip(self):
@@ -1061,9 +1088,9 @@ class TestEdgeCases(unittest.TestCase):
         self.assertIsNone(p['url'])
 
     def test_parse_malformed_shlex(self):
-        # Unclosed quote — should not raise
-        p = parse_curl('curl -H "Broken: value https://example.com')
-        self.assertIsNotNone(p)
+        # Unclosed quote falls back to .split(); URL should still be extracted
+        p = parse_curl('curl https://example.com -H "Broken: value')
+        self.assertEqual(p['url'], 'https://example.com')
 
     def test_url_with_fragment(self):
         p = parse_curl('curl https://example.com/page#section')
@@ -1083,7 +1110,6 @@ class TestEdgeCases(unittest.TestCase):
         self.assertNotIn('noequals', p['form'])
 
     def test_data_and_form_data_wins(self):
-        # -d comes before -F; form overrides body in execute_request
         p = parse_curl('curl -d "raw" https://example.com')
         self.assertEqual(p['data'], 'raw')
         self.assertEqual(p['form'], {})
@@ -1098,12 +1124,14 @@ class TestEdgeCases(unittest.TestCase):
 
     def test_timeout_zero_treated_as_default(self):
         # 0 is falsy → falls back to 30 in execute_request
-        patcher = patch('curl_client.requests.Session')
-        with patcher as mock_sess:
-            mock_sess.return_value.request.return_value = _make_response()
+        mock_session = MagicMock()
+        mock_session.request.return_value = _make_response()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        with patch('curl_client.requests.Session', return_value=mock_session):
             parsed = parse_curl('curl --max-time 0 https://example.com')
             execute_request(parsed)
-        _, kwargs = mock_sess.return_value.request.call_args
+        _, kwargs = mock_session.request.call_args
         _, tt = kwargs['timeout']
         self.assertEqual(tt, 30)
 
@@ -1659,6 +1687,365 @@ class TestSearchNavigation(unittest.TestCase):
         s._search_idx = 0
         s._search_prev()
         self.assertEqual(s._search_idx, 0)
+
+
+# ===========================================================================
+# 25. _worker — threading orchestration
+# ===========================================================================
+
+class TestWorker(unittest.TestCase):
+
+    def _make_stub(self):
+        stub = _types.SimpleNamespace()
+        stub.root = MagicMock()
+        stub.root.after.side_effect = lambda delay, fn: fn()
+        stub.req_text = MagicMock()
+        stub._add_to_history = MagicMock()
+        stub._save_error_history = MagicMock()
+        stub._set_text = MagicMock()
+        stub._show_response = MagicMock()
+        stub._show_error = MagicMock()
+        stub._worker = _types.MethodType(CurlApp._worker, stub)
+        return stub
+
+    def _parsed(self, **overrides):
+        base = {
+            'method': 'GET', 'url': 'https://example.com',
+            'headers': {}, 'data': None, 'form': {},
+            'auth': None, 'cookies': {}, 'cookie_jar': None,
+            'proxy': None, 'timeout_connect': None, 'timeout_total': None,
+            'allow_redirects': False, 'verify': True,
+            'compressed': False, 'ignored': [],
+        }
+        base.update(overrides)
+        return base
+
+    def _resp(self, **overrides):
+        base = {
+            'status_code': 200, 'status_text': 'OK', 'elapsed_ms': 100,
+            'headers': {}, 'body': '{}', 'content_type': 'application/json',
+            'final_url': 'https://example.com', 'size': 2,
+        }
+        base.update(overrides)
+        return base
+
+    # --- happy path ---
+
+    @patch('curl_client.execute_request')
+    @patch('curl_client.parse_curl')
+    def test_success_calls_add_to_history_with_status(self, mock_parse, mock_exec):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        mock_exec.return_value = self._resp(status_code=201)
+        stub._worker('curl https://example.com')
+        stub._add_to_history.assert_called_once_with(
+            'curl https://example.com', mock_parse.return_value, 201
+        )
+
+    @patch('curl_client.execute_request')
+    @patch('curl_client.parse_curl')
+    def test_success_calls_show_response(self, mock_parse, mock_exec):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        resp = self._resp()
+        mock_exec.return_value = resp
+        stub._worker('curl https://example.com')
+        stub._show_response.assert_called_once_with(resp)
+
+    @patch('curl_client.execute_request')
+    @patch('curl_client.parse_curl')
+    def test_req_info_contains_method_and_url(self, mock_parse, mock_exec):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed(method='POST', url='https://api.example.com')
+        mock_exec.return_value = self._resp()
+        stub._worker('curl -X POST https://api.example.com')
+        req_json = stub._set_text.call_args_list[0][0][1]
+        req_info = json.loads(req_json)
+        self.assertEqual(req_info['method'], 'POST')
+        self.assertEqual(req_info['url'], 'https://api.example.com')
+
+    @patch('curl_client.execute_request')
+    @patch('curl_client.parse_curl')
+    def test_auth_password_masked_in_req_info(self, mock_parse, mock_exec):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed(auth=('admin', 'secret'))
+        mock_exec.return_value = self._resp()
+        stub._worker('curl -u admin:secret https://example.com')
+        req_json = stub._set_text.call_args_list[0][0][1]
+        req_info = json.loads(req_json)
+        self.assertEqual(req_info['auth'], 'admin:***')
+
+    @patch('curl_client.execute_request')
+    @patch('curl_client.parse_curl')
+    def test_ignored_flags_appear_in_req_info(self, mock_parse, mock_exec):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed(ignored=['-s', '-v'])
+        mock_exec.return_value = self._resp()
+        stub._worker('curl -s -v https://example.com')
+        req_json = stub._set_text.call_args_list[0][0][1]
+        req_info = json.loads(req_json)
+        self.assertEqual(req_info['ignored_flags'], ['-s', '-v'])
+
+    # --- SSL error ---
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.SSLError("cert verify failed"))
+    @patch('curl_client.parse_curl')
+    def test_ssl_error_calls_save_error_history(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        stub._save_error_history.assert_called_once_with('curl https://example.com')
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.SSLError("cert verify failed"))
+    @patch('curl_client.parse_curl')
+    def test_ssl_error_message_mentions_ssl(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('SSL', msg)
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.SSLError("cert verify failed"))
+    @patch('curl_client.parse_curl')
+    def test_ssl_error_suggests_insecure_flag(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('-k', msg)
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.SSLError("cert verify failed"))
+    @patch('curl_client.parse_curl')
+    def test_ssl_error_does_not_call_add_to_history(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        stub._add_to_history.assert_not_called()
+
+    # --- connection error ---
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.ConnectionError("refused"))
+    @patch('curl_client.parse_curl')
+    def test_connection_error_calls_save_error_history(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        stub._save_error_history.assert_called_once_with('curl https://example.com')
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.ConnectionError("Connection refused"))
+    @patch('curl_client.parse_curl')
+    def test_connection_error_message_mentions_connection(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('Connection', msg)
+
+    # --- timeout ---
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.Timeout())
+    @patch('curl_client.parse_curl')
+    def test_timeout_calls_save_error_history(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        stub._save_error_history.assert_called_once_with('curl https://example.com')
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.Timeout())
+    @patch('curl_client.parse_curl')
+    def test_timeout_message_says_timed_out(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('timed out', msg)
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.Timeout())
+    @patch('curl_client.parse_curl')
+    def test_timeout_message_includes_configured_timeouts(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed(timeout_connect=5.0, timeout_total=30.0)
+        stub._worker('curl --connect-timeout 5 -m 30 https://example.com')
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('30', msg)
+        self.assertIn('5', msg)
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.Timeout())
+    @patch('curl_client.parse_curl')
+    def test_timeout_message_defaults_to_30s(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('30', msg)
+
+    @patch('curl_client.execute_request', side_effect=requests.exceptions.Timeout())
+    @patch('curl_client.parse_curl')
+    def test_timeout_uses_parsed_dict_not_re_parse(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed(timeout_connect=3.0, timeout_total=10.0)
+        stub._worker('curl --connect-timeout 3 -m 10 https://example.com')
+        # parse_curl should only be called once — no re-parse inside the Timeout handler
+        mock_parse.assert_called_once()
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('10', msg)
+        self.assertIn('3', msg)
+
+    # --- generic error ---
+
+    @patch('curl_client.execute_request', side_effect=ValueError("bad input"))
+    @patch('curl_client.parse_curl')
+    def test_generic_error_calls_save_error_history(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        stub._save_error_history.assert_called_once_with('curl https://example.com')
+
+    @patch('curl_client.execute_request', side_effect=ValueError("bad input"))
+    @patch('curl_client.parse_curl')
+    def test_generic_error_message_contains_exception_text(self, mock_parse, _):
+        stub = self._make_stub()
+        mock_parse.return_value = self._parsed()
+        stub._worker('curl https://example.com')
+        msg = stub._show_error.call_args[0][0]
+        self.assertIn('bad input', msg)
+
+
+# ===========================================================================
+# 26. _add_to_history
+# ===========================================================================
+
+class TestAddToHistory(unittest.TestCase):
+
+    def _make_stub(self):
+        stub = _types.SimpleNamespace()
+        stub.root = MagicMock()
+        stub._history = []
+        stub._refresh_history_ui = MagicMock()
+        stub._add_to_history = _types.MethodType(CurlApp._add_to_history, stub)
+        return stub
+
+    @patch('curl_client.save_history')
+    def test_prepends_new_entry(self, _):
+        stub = self._make_stub()
+        stub._history = [{'curl': 'old', 'method': 'GET', 'url': 'https://old.com',
+                          'status_code': 200, 'timestamp': 0}]
+        stub._add_to_history('curl https://new.com', {'method': 'GET', 'url': 'https://new.com'}, 200)
+        self.assertEqual(stub._history[0]['url'], 'https://new.com')
+
+    @patch('curl_client.save_history')
+    def test_entry_has_all_required_fields(self, _):
+        stub = self._make_stub()
+        stub._add_to_history('curl https://example.com',
+                             {'method': 'POST', 'url': 'https://example.com'}, 201)
+        entry = stub._history[0]
+        self.assertEqual(entry['curl'], 'curl https://example.com')
+        self.assertEqual(entry['method'], 'POST')
+        self.assertEqual(entry['url'], 'https://example.com')
+        self.assertEqual(entry['status_code'], 201)
+        self.assertIn('timestamp', entry)
+
+    @patch('curl_client.save_history')
+    def test_trims_to_history_max(self, _):
+        stub = self._make_stub()
+        stub._history = [
+            {'curl': f'c{i}', 'method': 'GET', 'url': f'https://example.com/{i}',
+             'status_code': 200, 'timestamp': 0}
+            for i in range(HISTORY_MAX)
+        ]
+        stub._add_to_history('curl https://new.com', {'method': 'GET', 'url': 'https://new.com'}, 200)
+        self.assertEqual(len(stub._history), HISTORY_MAX)
+
+    @patch('curl_client.save_history')
+    def test_calls_save_history(self, mock_save):
+        stub = self._make_stub()
+        stub._add_to_history('curl https://example.com',
+                             {'method': 'GET', 'url': 'https://example.com'}, 200)
+        mock_save.assert_called_once_with(stub._history)
+
+    @patch('curl_client.save_history')
+    def test_schedules_ui_refresh(self, _):
+        stub = self._make_stub()
+        stub._add_to_history('curl https://example.com',
+                             {'method': 'GET', 'url': 'https://example.com'}, 200)
+        stub.root.after.assert_called_once_with(0, stub._refresh_history_ui)
+
+    @patch('curl_client.save_history')
+    def test_null_status_code_stored(self, _):
+        stub = self._make_stub()
+        stub._add_to_history('curl https://example.com',
+                             {'method': 'GET', 'url': 'https://example.com'}, None)
+        self.assertIsNone(stub._history[0]['status_code'])
+
+    @patch('curl_client.save_history')
+    def test_null_url_stored_as_empty_string(self, _):
+        stub = self._make_stub()
+        stub._add_to_history('curl', {'method': 'GET', 'url': None}, 200)
+        self.assertEqual(stub._history[0]['url'], '')
+
+
+# ===========================================================================
+# 27. _save_error_history
+# ===========================================================================
+
+class TestSaveErrorHistory(unittest.TestCase):
+
+    def _make_stub(self):
+        stub = _types.SimpleNamespace()
+        stub._add_to_history = MagicMock()
+        stub._save_error_history = _types.MethodType(CurlApp._save_error_history, stub)
+        return stub
+
+    def test_calls_add_to_history_with_none_status(self):
+        stub = self._make_stub()
+        stub._save_error_history('curl https://example.com')
+        args = stub._add_to_history.call_args[0]
+        self.assertIsNone(args[2])
+
+    def test_passes_curl_text_through(self):
+        stub = self._make_stub()
+        stub._save_error_history('curl -X POST https://example.com')
+        args = stub._add_to_history.call_args[0]
+        self.assertEqual(args[0], 'curl -X POST https://example.com')
+
+    def test_parsed_method_forwarded(self):
+        stub = self._make_stub()
+        stub._save_error_history('curl -X DELETE https://example.com')
+        parsed = stub._add_to_history.call_args[0][1]
+        self.assertEqual(parsed['method'], 'DELETE')
+
+    def test_parse_failure_falls_back_to_defaults(self):
+        stub = self._make_stub()
+        with patch('curl_client.parse_curl', side_effect=Exception("parse failed")):
+            stub._save_error_history('curl https://example.com')
+        parsed = stub._add_to_history.call_args[0][1]
+        self.assertEqual(parsed['method'], 'GET')
+        self.assertEqual(parsed['url'], '')
+
+
+# ===========================================================================
+# 28. _history_path
+# ===========================================================================
+
+class TestHistoryPath(unittest.TestCase):
+
+    def test_ends_with_history_json(self):
+        import curl_client as _cc
+        self.assertTrue(_cc._history_path().endswith('history.json'))
+
+    def test_non_frozen_is_beside_script(self):
+        import curl_client as _cc
+        expected_dir = os.path.dirname(os.path.abspath(_cc.__file__))
+        self.assertEqual(os.path.dirname(_cc._history_path()), expected_dir)
+
+    def test_frozen_uses_executable_directory(self):
+        import curl_client as _cc
+        fake_exe = '/fake/dist/CurlClient'
+        with patch.object(sys, 'frozen', True, create=True), \
+             patch.object(sys, 'executable', fake_exe):
+            path = _cc._history_path()
+        self.assertEqual(os.path.dirname(path), os.path.dirname(fake_exe))
+        self.assertTrue(path.endswith('history.json'))
 
 
 if __name__ == '__main__':

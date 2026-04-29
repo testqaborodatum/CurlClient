@@ -14,11 +14,30 @@ import shlex
 import time
 import os
 import sys
+from urllib.parse import quote_plus
 
 
 # ---------------------------------------------------------------------------
 # Curl parser
 # ---------------------------------------------------------------------------
+
+_SKIP_WITH_VALUE = {
+    '--limit-rate',
+    '-o', '--output', '-A', '--user-agent',
+    '--url', '-e', '--referer',
+    '--cert', '--key', '--cacert', '--capath',
+    '--dns-servers', '--resolve', '--interface',
+    '-T', '--upload-file', '--retry', '--retry-delay',
+    '--write-out', '-w', '--max-redirs',
+}
+
+_SKIP_FLAG = {
+    '-s', '-S', '--silent', '--show-error', '-v', '--verbose',
+    '-i', '--include', '--http1.0', '--http1.1',
+    '--http2', '--http2-prior-knowledge', '--no-keepalive',
+    '-4', '--ipv4', '-6', '--ipv6', '-n', '--netrc',
+    '--no-buffer', '-N',
+}
 
 def _unescape_windows(raw: str) -> str:
     """Remove Windows CMD ^ escape characters and join continuation lines."""
@@ -76,24 +95,6 @@ def parse_curl(raw: str) -> dict:
         'ignored': [],
     }
 
-    SKIP_WITH_VALUE = {
-        '--limit-rate',
-        '-o', '--output', '-A', '--user-agent',
-        '--url', '-e', '--referer',
-        '--cert', '--key', '--cacert', '--capath',
-        '--dns-servers', '--resolve', '--interface',
-        '-T', '--upload-file', '--retry', '--retry-delay',
-        '--write-out', '-w', '--max-redirs',
-    }
-
-    SKIP_FLAG = {
-        '-s', '-S', '--silent', '--show-error', '-v', '--verbose',
-        '-i', '--include', '--http1.0', '--http1.1',
-        '--http2', '--http2-prior-knowledge', '--no-keepalive',
-        '-4', '--ipv4', '-6', '--ipv6', '-n', '--netrc',
-        '--no-buffer', '-N',
-    }
-
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -117,9 +118,22 @@ def parse_curl(raw: str) -> dict:
                 i += 2
             else:
                 i += 1
-        elif tok in ('-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode'):
+        elif tok in ('-d', '--data', '--data-raw', '--data-binary', '--data-ascii'):
             if i + 1 < len(tokens):
                 result['data'] = tokens[i + 1]
+                if result['method'] == 'GET':
+                    result['method'] = 'POST'
+                i += 2
+            else:
+                i += 1
+        elif tok == '--data-urlencode':
+            if i + 1 < len(tokens):
+                val = tokens[i + 1]
+                eq = val.find('=')
+                if eq != -1:
+                    result['data'] = f"{val[:eq]}={quote_plus(val[eq + 1:])}"
+                else:
+                    result['data'] = quote_plus(val)
                 if result['method'] == 'GET':
                     result['method'] = 'POST'
                 i += 2
@@ -202,10 +216,10 @@ def parse_curl(raw: str) -> dict:
         elif tok in ('-I', '--head'):
             result['method'] = 'HEAD'
             i += 1
-        elif tok in SKIP_FLAG:
+        elif tok in _SKIP_FLAG:
             result['ignored'].append(tok)
             i += 1
-        elif tok in SKIP_WITH_VALUE:
+        elif tok in _SKIP_WITH_VALUE:
             if i + 1 < len(tokens):
                 result['ignored'].append(f'{tok} {tokens[i + 1]}')
                 i += 2
@@ -216,8 +230,10 @@ def parse_curl(raw: str) -> dict:
             result['url'] = tok
             i += 1
         elif tok.startswith('--') or (tok.startswith('-') and len(tok) == 2):
-            if i + 1 < len(tokens) and not tokens[i + 1].startswith('-'):
-                result['ignored'].append(f'{tok} {tokens[i + 1]}')
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ''
+            if (nxt and not nxt.startswith('-')
+                    and not nxt.startswith('http://') and not nxt.startswith('https://')):
+                result['ignored'].append(f'{tok} {nxt}')
                 i += 2
             else:
                 result['ignored'].append(tok)
@@ -238,12 +254,8 @@ def execute_request(parsed: dict) -> dict:
     if not parsed['url']:
         raise ValueError("No URL found in curl command")
 
-    session = requests.Session()
-
-    # Timeout: (connect, read) tuple; defaults to 30s each
     tc = parsed.get('timeout_connect') or 30
     tt = parsed.get('timeout_total') or 30
-    timeout = (tc, tt)
 
     headers = dict(parsed['headers'])
     if parsed.get('compressed') and 'Accept-Encoding' not in headers:
@@ -253,7 +265,7 @@ def execute_request(parsed: dict) -> dict:
         'headers': headers,
         'allow_redirects': parsed['allow_redirects'],
         'verify': parsed['verify'],
-        'timeout': timeout,
+        'timeout': (tc, tt),
     }
 
     if parsed.get('auth'):
@@ -265,25 +277,32 @@ def execute_request(parsed: dict) -> dict:
     if parsed.get('proxy'):
         kwargs['proxies'] = {'http': parsed['proxy'], 'https': parsed['proxy']}
 
+    opened_files = []
     if parsed['data'] is not None:
         kwargs['data'] = parsed['data'].encode('utf-8') if isinstance(parsed['data'], str) else parsed['data']
     elif parsed['form']:
-        # -F always sends multipart/form-data; @path uploads a file
         files = {}
         for k, v in parsed['form'].items():
             if isinstance(v, str) and v.startswith('@'):
                 filepath = v[1:]
                 try:
-                    files[k] = (os.path.basename(filepath), open(filepath, 'rb'))
+                    fh = open(filepath, 'rb')
+                    opened_files.append(fh)
+                    files[k] = (os.path.basename(filepath), fh)
                 except OSError:
                     files[k] = (None, v)
             else:
                 files[k] = (None, v)
         kwargs['files'] = files
 
-    start = time.time()
-    resp = session.request(parsed['method'], parsed['url'], **kwargs)
-    elapsed = time.time() - start
+    with requests.Session() as session:
+        start = time.time()
+        try:
+            resp = session.request(parsed['method'], parsed['url'], **kwargs)
+        finally:
+            for fh in opened_files:
+                fh.close()
+        elapsed = time.time() - start
 
     if parsed.get('cookie_jar'):
         try:
@@ -480,7 +499,6 @@ SUBTEXT  = '#a6adc8'
 GREEN    = '#a6e3a1'
 RED      = '#f38ba8'
 YELLOW   = '#f9e2af'
-ORANGE   = '#fab387'
 FONT_MONO = ('Cascadia Code', 10)
 FONT_UI   = ('Segoe UI', 10)
 FONT_UI_B = ('Segoe UI', 10, 'bold')
@@ -507,6 +525,7 @@ class CurlApp:
 
         self._history: list = load_history()
         self._history_frames: list = []
+        self._has_placeholder: bool = False
 
         self._setup_styles()
         self._build_ui()
@@ -1096,14 +1115,14 @@ class CurlApp:
         self._has_placeholder = True
 
     def _on_focus_in(self, _event):
-        if getattr(self, '_has_placeholder', False):
+        if self._has_placeholder:
             self.curl_input.delete('1.0', tk.END)
             self.curl_input.config(fg=TEXT)
             self._has_placeholder = False
 
     def _on_paste(self, _event):
         # Clear placeholder before paste lands so clipboard text isn't appended to it
-        if getattr(self, '_has_placeholder', False):
+        if self._has_placeholder:
             self.curl_input.delete('1.0', tk.END)
             self.curl_input.config(fg=TEXT)
             self._has_placeholder = False
@@ -1127,7 +1146,7 @@ class CurlApp:
             menu.grab_release()
 
     def _paste_from_menu(self):
-        if getattr(self, '_has_placeholder', False):
+        if self._has_placeholder:
             self.curl_input.delete('1.0', tk.END)
             self.curl_input.config(fg=TEXT)
             self._has_placeholder = False
@@ -1138,7 +1157,7 @@ class CurlApp:
     # ------------------------------------------------------------------
 
     def _send(self):
-        if getattr(self, '_has_placeholder', False):
+        if self._has_placeholder:
             return
         text = self.curl_input.get('1.0', tk.END).strip()
         if not text:
@@ -1180,28 +1199,29 @@ class CurlApp:
             self.root.after(0, lambda: self._set_text(self.req_text, req_display))
 
             resp = execute_request(parsed)
-            self._add_to_history(curl_text, parsed, resp['status_code'])
-            self.root.after(0, lambda: self._show_response(resp))
+
+            def _on_success(r=resp):
+                self._add_to_history(curl_text, parsed, r['status_code'])
+                self._show_response(r)
+            self.root.after(0, _on_success)
 
         except requests.exceptions.SSLError as e:
-            self._save_error_history(curl_text)
-            self.root.after(0, lambda: self._show_error(f"SSL Error: {e}\n\nTip: try adding -k to skip SSL verification."))
+            msg = f"SSL Error: {e}\n\nTip: try adding -k to skip SSL verification."
+            self.root.after(0, lambda m=msg: [self._save_error_history(curl_text), self._show_error(m)])
         except requests.exceptions.ConnectionError as e:
-            self._save_error_history(curl_text)
-            self.root.after(0, lambda: self._show_error(f"Connection Error:\n{e}"))
+            cause = e
+            while cause.__cause__:
+                cause = cause.__cause__
+            msg = f"Connection Error: {str(cause).splitlines()[0]}"
+            self.root.after(0, lambda m=msg: [self._save_error_history(curl_text), self._show_error(m)])
         except requests.exceptions.Timeout:
-            self._save_error_history(curl_text)
-            try:
-                p = parse_curl(curl_text)
-                tt = p.get('timeout_total') or 30
-                tc = p.get('timeout_connect') or 30
-                tmsg = f"total={tt}s, connect={tc}s"
-            except Exception:
-                tmsg = "30s"
-            self.root.after(0, lambda: self._show_error(f"Request timed out ({tmsg})"))
+            tt = parsed.get('timeout_total') or 30
+            tc = parsed.get('timeout_connect') or 30
+            msg = f"Request timed out (total={tt}s, connect={tc}s)"
+            self.root.after(0, lambda m=msg: [self._save_error_history(curl_text), self._show_error(m)])
         except Exception as e:
-            self._save_error_history(curl_text)
-            self.root.after(0, lambda: self._show_error(str(e)))
+            msg = str(e)
+            self.root.after(0, lambda m=msg: [self._save_error_history(curl_text), self._show_error(m)])
 
     def _save_error_history(self, curl_text: str):
         try:
@@ -1277,15 +1297,6 @@ def _all_children(widget) -> list:
         result.append(child)
         result.extend(_all_children(child))
     return result
-
-
-def _set_bg_recursive(widget, color: str):
-    try:
-        widget.config(bg=color)
-    except tk.TclError:
-        pass
-    for child in widget.winfo_children():
-        _set_bg_recursive(child, color)
 
 
 # ---------------------------------------------------------------------------
