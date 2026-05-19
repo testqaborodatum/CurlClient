@@ -20,8 +20,9 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
 - Response viewer with three tabs: **Body**, **Response Headers**, **Parsed Request**
   - **Parsed Request** tab shows exactly what was sent — method, URL, headers, auth, cookies, cookie-jar path, proxy, timeouts, and any flags that were silently ignored
 - **Find bar** — search text inside any response tab (Ctrl+F, ◀ ▶ navigation, match counter)
+- **Attach File** button — opens a file picker and inserts `-F "file=@path"` into the command; if a `file=@` parameter already exists, the path is replaced in-place
 - Right-click context menu (Cut / Copy / Paste / Select All)
-- Keyboard shortcuts:
+- Keyboard shortcuts work with **any keyboard layout** (Cyrillic, Arabic, etc.):
   | Shortcut | Action |
   |---|---|
   | `Ctrl + Enter` | Send request |
@@ -42,7 +43,7 @@ A lightweight desktop app for sending HTTP requests by pasting curl commands —
 | `-X / --request` | HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD) |
 | `-d / --data` | Raw request body (`--data-raw`, `--data-binary`, `--data-ascii`) |
 | `--data-urlencode` | Request body with value percent-encoded (`name=value` or bare `value`) |
-| `-F / --form` | Multipart form-data fields; `@path` uploads a file |
+| `-F / --form` | Multipart form-data fields; `@path` uploads a file; `@path;type=mime` sets content-type |
 | `-u / --user` | Basic auth (`user:password`) |
 | `-b / --cookie` | Send cookies (`"name=value; name2=value2"`) |
 | `-c / --cookie-jar` | Save response cookies to a file |

@@ -5,7 +5,7 @@ Accepts curl commands in Windows (^) and Mac (backslash) formats
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import threading
 import requests
 import re
@@ -284,11 +284,23 @@ def execute_request(parsed: dict) -> dict:
         files = {}
         for k, v in parsed['form'].items():
             if isinstance(v, str) and v.startswith('@'):
-                filepath = v[1:]
+                raw = v[1:]
+                # Strip curl modifiers: @path;type=mime/type;filename=name
+                content_type = None
+                filename_override = None
+                if ';' in raw:
+                    parts = raw.split(';')
+                    raw = parts[0]
+                    for part in parts[1:]:
+                        if part.startswith('type='):
+                            content_type = part[5:]
+                        elif part.startswith('filename='):
+                            filename_override = part[9:]
+                fname = filename_override or os.path.basename(raw)
                 try:
-                    fh = open(filepath, 'rb')
+                    fh = open(raw, 'rb')
                     opened_files.append(fh)
-                    files[k] = (os.path.basename(filepath), fh)
+                    files[k] = (fname, fh, content_type) if content_type else (fname, fh)
                 except OSError:
                     files[k] = (None, v)
             else:
@@ -395,6 +407,8 @@ class Tooltip:
         self._tip: tk.Toplevel | None = None
         self._show_id = None
         self._hide_id = None
+        self._root = item.winfo_toplevel()
+        self._focusout_id: str | None = None
 
     def bind_all(self, widgets):
         for w in widgets:
@@ -454,6 +468,8 @@ class Tooltip:
         tk.Label(outer, text=self._text, bg='#313244', fg=TEXT,
                  font=FONT_SM, padx=10, pady=6,
                  justify=tk.LEFT, wraplength=540).pack()
+        # Hide when user alt-tabs away from the app
+        self._focusout_id = self._root.bind('<FocusOut>', lambda _e: self.close(), add='+')
 
     def _hide(self):
         if self._tip:
@@ -462,6 +478,12 @@ class Tooltip:
             except tk.TclError:
                 pass
             self._tip = None
+        if self._focusout_id is not None:
+            try:
+                self._root.unbind('<FocusOut>', self._focusout_id)
+            except tk.TclError:
+                pass
+            self._focusout_id = None
 
     def _cancel_show(self):
         if self._show_id:
@@ -690,18 +712,47 @@ class CurlApp:
         self.curl_input.bind('<FocusIn>',  self._on_focus_in)
         self.curl_input.bind('<<Paste>>',  self._on_paste)
         self.curl_input.bind('<Button-3>', self._show_context_menu)
-        # Select-all: Ctrl+A (Windows/Linux) and Cmd+A / Meta+A (macOS)
-        for _seq in ('<Control-a>', '<Control-A>',
-                     '<Command-a>', '<Command-A>',
-                     '<Meta-a>',   '<Meta-A>'):
+        # macOS: Cmd+A select-all, Cmd+Y / Cmd+Shift+Z redo
+        for _seq in ('<Command-a>', '<Command-A>', '<Meta-a>', '<Meta-A>'):
             self.curl_input.bind(_seq, lambda e: self._select_all(self.curl_input))
-        # Redo: Ctrl+Y (Windows/Linux) and Cmd+Y / Cmd+Shift+Z (macOS)
-        for _seq in ('<Control-y>', '<Control-Y>',
-                     '<Command-y>', '<Command-Y>',
-                     '<Meta-y>',   '<Meta-Y>',
+        for _seq in ('<Command-y>', '<Command-Y>', '<Meta-y>', '<Meta-Y>',
                      '<Command-Shift-z>', '<Command-Shift-Z>',
                      '<Meta-Shift-z>',   '<Meta-Shift-Z>'):
             self.curl_input.bind(_seq, lambda e: (self.curl_input.edit_redo(), 'break')[-1])
+        if sys.platform == 'win32':
+            # Windows: all Ctrl hotkeys via hardware keycode — works for any keyboard layout
+            def _ctrl_key_input(event):
+                kc = event.keycode
+                if kc == 65:   # A — select all
+                    return self._select_all(self.curl_input)
+                if kc == 67:   # C — copy
+                    self.curl_input.event_generate('<<Copy>>')
+                    return 'break'
+                if kc == 86:   # V — paste
+                    self.curl_input.event_generate('<<Paste>>')
+                    return 'break'
+                if kc == 88:   # X — cut
+                    self.curl_input.event_generate('<<Cut>>')
+                    return 'break'
+                if kc == 89:   # Y — redo
+                    try:
+                        self.curl_input.edit_redo()
+                    except tk.TclError:
+                        pass
+                    return 'break'
+                if kc == 90:   # Z — undo
+                    try:
+                        self.curl_input.edit_undo()
+                    except tk.TclError:
+                        pass
+                    return 'break'
+            self.curl_input.bind('<Control-Key>', _ctrl_key_input)
+        else:
+            # Linux: standard keysym bindings
+            for _seq in ('<Control-a>', '<Control-A>'):
+                self.curl_input.bind(_seq, lambda e: self._select_all(self.curl_input))
+            for _seq in ('<Control-y>', '<Control-Y>'):
+                self.curl_input.bind(_seq, lambda e: (self.curl_input.edit_redo(), 'break')[-1])
 
         # Button row
         btn_row = tk.Frame(content, bg=BG)
@@ -713,6 +764,9 @@ class CurlApp:
 
         ttk.Button(btn_row, text="Clear", style='Clear.TButton',
                    command=self._clear).pack(side=tk.LEFT, padx=8)
+
+        ttk.Button(btn_row, text="Attach File", style='Clear.TButton',
+                   command=self._attach_file).pack(side=tk.LEFT)
 
         status_row = tk.Frame(btn_row, bg=BG)
         status_row.pack(side=tk.LEFT, padx=4)
@@ -774,9 +828,14 @@ class CurlApp:
         for widget in (self.body_text, self.headers_text, self.req_text):
             self._bind_readonly_keys(widget)
 
-        # Ctrl+F focuses search entry
-        for seq in ('<Control-f>', '<Control-F>'):
-            self.root.bind(seq, lambda _e: self._search_entry.focus_set())
+        if sys.platform == 'win32':
+            def _ctrl_key_root(event):
+                if event.keycode == 70:   # F — focus search
+                    self._search_entry.focus_set()
+            self.root.bind('<Control-Key>', _ctrl_key_root)
+        else:
+            for seq in ('<Control-f>', '<Control-F>'):
+                self.root.bind(seq, lambda _e: self._search_entry.focus_set())
 
     # ------------------------------------------------------------------
     # Search in response
@@ -1071,14 +1130,23 @@ class CurlApp:
             widget.tag_add(tk.SEL, '1.0', tk.END)
             return 'break'
 
-        for seq in ('<Control-c>', '<Control-C>',
-                    '<Command-c>', '<Command-C>',
-                    '<Meta-c>',   '<Meta-C>'):
+        for seq in ('<Command-c>', '<Command-C>', '<Meta-c>', '<Meta-C>'):
             widget.bind(seq, _copy)
-        for seq in ('<Control-a>', '<Control-A>',
-                    '<Command-a>', '<Command-A>',
-                    '<Meta-a>',   '<Meta-A>'):
+        for seq in ('<Command-a>', '<Command-A>', '<Meta-a>', '<Meta-A>'):
             widget.bind(seq, _sel_all)
+        if sys.platform == 'win32':
+            def _ctrl_key_readonly(event):
+                kc = event.keycode
+                if kc == 67:   # C — copy
+                    return _copy(event)
+                if kc == 65:   # A — select all
+                    return _sel_all(event)
+            widget.bind('<Control-Key>', _ctrl_key_readonly)
+        else:
+            for seq in ('<Control-c>', '<Control-C>'):
+                widget.bind(seq, _copy)
+            for seq in ('<Control-a>', '<Control-A>'):
+                widget.bind(seq, _sel_all)
 
     # ------------------------------------------------------------------
     # History data management
@@ -1269,6 +1337,35 @@ class CurlApp:
         for w in (self.body_text, self.headers_text, self.req_text):
             self._set_text(w, '')
         self._set_status("Ready", SUBTEXT)
+
+    def _attach_file(self):
+        path = filedialog.askopenfilename(title="Select file to attach")
+        if not path:
+            return
+        safe = path.replace('\\', '/')
+        if ' ' in safe:
+            safe = f'"{safe}"'
+
+        if self._has_placeholder:
+            self.curl_input.delete('1.0', tk.END)
+            self.curl_input.config(fg=TEXT)
+            self._has_placeholder = False
+            self.curl_input.insert(tk.INSERT, f' -F "file=@{safe}"')
+            return
+
+        content = self.curl_input.get('1.0', tk.END)
+        # Replace existing file=@ value if present, otherwise append
+        new_content, n = re.subn(
+            r"""-F\s+(?:"file=@[^"]*"|'file=@[^']*')""",
+            f'-F "file=@{safe}"',
+            content,
+            count=1,
+        )
+        if n:
+            self.curl_input.delete('1.0', tk.END)
+            self.curl_input.insert('1.0', new_content.rstrip('\n'))
+        else:
+            self.curl_input.insert(tk.INSERT, f' -F "file=@{safe}"')
 
     # ------------------------------------------------------------------
     # Helpers

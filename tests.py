@@ -925,6 +925,48 @@ class TestExecuteRequest(unittest.TestCase):
         finally:
             os.unlink(fpath)
 
+    def test_form_file_upload_with_content_type(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.funscript') as f:
+            f.write(b'funscript data')
+            fpath = f.name
+        fpath_fwd = fpath.replace('\\', '/')
+        try:
+            patcher, session = self._mock_session()
+            with patcher:
+                parsed = parse_curl(
+                    f'curl -F "file=@{fpath_fwd};type=application/octet-stream" https://example.com'
+                )
+                execute_request(parsed)
+            _, kwargs = session.request.call_args
+            fname, fobj, ctype = kwargs['files']['file']
+            self.assertEqual(ctype, 'application/octet-stream')
+            self.assertEqual(fname, os.path.basename(fpath))
+            fobj.close()
+        finally:
+            os.unlink(fpath)
+
+    def test_form_file_upload_type_not_in_path(self):
+        # Ensure ;type= is stripped from the filesystem path before open()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as f:
+            f.write(b'\x00\x01')
+            fpath = f.name
+        fpath_fwd = fpath.replace('\\', '/')
+        try:
+            patcher, session = self._mock_session()
+            with patcher:
+                parsed = parse_curl(
+                    f'curl -F "data=@{fpath_fwd};type=application/octet-stream" https://example.com'
+                )
+                # Should not fall back to raw value — file must actually be opened
+                execute_request(parsed)
+            _, kwargs = session.request.call_args
+            fname, fobj, _ = kwargs['files']['data']
+            self.assertIsNotNone(fobj)
+            self.assertNotIn(';type=', fname)
+            fobj.close()
+        finally:
+            os.unlink(fpath)
+
     def test_form_missing_file_fallback(self):
         patcher, session = self._mock_session()
         with patcher:
@@ -2046,6 +2088,146 @@ class TestHistoryPath(unittest.TestCase):
             path = _cc._history_path()
         self.assertEqual(os.path.dirname(path), os.path.dirname(fake_exe))
         self.assertTrue(path.endswith('history.json'))
+
+
+# ===========================================================================
+# 29. _attach_file
+# ===========================================================================
+
+class TestAttachFile(unittest.TestCase):
+
+    def _make_stub(self, has_placeholder=False, content='curl https://example.com'):
+        stub = _types.SimpleNamespace()
+        stub.curl_input = MagicMock()
+        stub.curl_input.get.return_value = content + '\n'  # tkinter adds trailing \n
+        stub._has_placeholder = has_placeholder
+        stub._attach_file = _types.MethodType(CurlApp._attach_file, stub)
+        return stub
+
+    # ---- dialog cancelled ----
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='')
+    def test_no_op_when_dialog_cancelled(self, _):
+        stub = self._make_stub()
+        stub._attach_file()
+        stub.curl_input.insert.assert_not_called()
+
+    # ---- append when no existing file=@ ----
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/data.json')
+    def test_inserts_form_file_snippet(self, _):
+        stub = self._make_stub()
+        stub._attach_file()
+        stub.curl_input.insert.assert_called_once()
+        snippet = stub.curl_input.insert.call_args[0][1]
+        self.assertIn('-F', snippet)
+        self.assertIn('@', snippet)
+        self.assertIn('data.json', snippet)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='C:\\Users\\user\\file.txt')
+    def test_backslashes_normalised(self, _):
+        stub = self._make_stub()
+        stub._attach_file()
+        snippet = stub.curl_input.insert.call_args[0][1]
+        self.assertNotIn('\\', snippet)
+        self.assertIn('/', snippet)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/home/user/my file.pdf')
+    def test_path_with_spaces_quoted(self, _):
+        stub = self._make_stub()
+        stub._attach_file()
+        snippet = stub.curl_input.insert.call_args[0][1]
+        self.assertIn('"', snippet)
+        self.assertIn('my file.pdf', snippet)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/report.pdf')
+    def test_path_without_spaces_not_double_quoted(self, _):
+        stub = self._make_stub()
+        stub._attach_file()
+        snippet = stub.curl_input.insert.call_args[0][1]
+        self.assertNotIn('""', snippet)
+
+    # ---- placeholder handling ----
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/file.bin')
+    def test_placeholder_cleared_when_set(self, _):
+        stub = self._make_stub(has_placeholder=True)
+        stub._attach_file()
+        stub.curl_input.delete.assert_called_once()
+        self.assertFalse(stub._has_placeholder)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/file.bin')
+    def test_no_delete_when_no_placeholder_and_no_match(self, _):
+        stub = self._make_stub(has_placeholder=False)
+        stub._attach_file()
+        stub.curl_input.delete.assert_not_called()
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/file.bin')
+    def test_insert_called_after_placeholder_cleared(self, _):
+        stub = self._make_stub(has_placeholder=True)
+        call_order = []
+        stub.curl_input.delete.side_effect = lambda *a: call_order.append('delete')
+        stub.curl_input.insert.side_effect = lambda *a: call_order.append('insert')
+        stub._attach_file()
+        self.assertEqual(call_order, ['delete', 'insert'])
+
+    # ---- replace existing file=@ ----
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/new.bin')
+    def test_replaces_existing_file_path_double_quotes(self, _):
+        existing = 'curl -X POST https://example.com -F "file=@/tmp/old.bin"'
+        stub = self._make_stub(content=existing)
+        stub._attach_file()
+        stub.curl_input.delete.assert_called_once()
+        written = stub.curl_input.insert.call_args[0][1]
+        self.assertIn('/tmp/new.bin', written)
+        self.assertNotIn('/tmp/old.bin', written)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/new.bin')
+    def test_replaces_existing_file_path_single_quotes(self, _):
+        existing = "curl -X POST https://example.com -F 'file=@/tmp/old.bin'"
+        stub = self._make_stub(content=existing)
+        stub._attach_file()
+        written = stub.curl_input.insert.call_args[0][1]
+        self.assertIn('/tmp/new.bin', written)
+        self.assertNotIn('/tmp/old.bin', written)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/new.bin')
+    def test_replaces_path_with_type_modifier(self, _):
+        existing = 'curl -X POST https://example.com -F "file=@/tmp/old.bin;type=application/octet-stream"'
+        stub = self._make_stub(content=existing)
+        stub._attach_file()
+        written = stub.curl_input.insert.call_args[0][1]
+        self.assertIn('/tmp/new.bin', written)
+        self.assertNotIn('/tmp/old.bin', written)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/new.bin')
+    def test_replace_preserves_rest_of_command(self, _):
+        existing = 'curl -X POST https://example.com -F "file=@/tmp/old.bin" -F "axisType=1"'
+        stub = self._make_stub(content=existing)
+        stub._attach_file()
+        written = stub.curl_input.insert.call_args[0][1]
+        self.assertIn('axisType=1', written)
+        self.assertIn('https://example.com', written)
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/new.bin')
+    def test_replace_uses_delete_then_insert(self, _):
+        existing = 'curl https://example.com -F "file=@/tmp/old.bin"'
+        stub = self._make_stub(content=existing)
+        call_order = []
+        stub.curl_input.delete.side_effect = lambda *a: call_order.append('delete')
+        stub.curl_input.insert.side_effect = lambda *a: call_order.append('insert')
+        stub._attach_file()
+        self.assertEqual(call_order, ['delete', 'insert'])
+
+    @patch('curl_client.filedialog.askopenfilename', return_value='/tmp/new.bin')
+    def test_no_existing_file_falls_back_to_append(self, _):
+        stub = self._make_stub(content='curl https://example.com')
+        stub._attach_file()
+        # insert called with INSERT position (append), not '1.0' (replace)
+        pos = stub.curl_input.insert.call_args[0][0]
+        import tkinter as tk
+        self.assertNotEqual(str(pos), '1.0')
 
 
 if __name__ == '__main__':
