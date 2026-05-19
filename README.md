@@ -80,6 +80,25 @@ curl 'https://api.example.com/data' \
 
 ---
 
+## Download
+
+Pre-built binaries are attached to every [GitHub Release](../../releases):
+
+| Platform | File |
+|---|---|
+| Windows | `CurlClient.exe` — portable, no install needed |
+| macOS | `CurlClient-macOS.dmg` — drag to Applications |
+
+To trigger a new release, push a version tag:
+
+```bash
+git tag v1.2.0 && git push origin v1.2.0
+```
+
+GitHub Actions builds both binaries and attaches them automatically.
+
+---
+
 ## Getting started
 
 ### Run from source

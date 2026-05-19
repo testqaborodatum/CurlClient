@@ -2,5 +2,6 @@ dist/
 build/
 __pycache__/
 *.spec
+!CurlClient.spec
 *.pyc
 history.json

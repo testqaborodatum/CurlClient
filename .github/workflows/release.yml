@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests pyinstaller
+
+      - name: Run tests
+        run: python -m pytest tests.py -q
+
+      - name: Build .exe
+        run: pyinstaller CurlClient.spec --noconfirm
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CurlClient.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip3 install requests pyinstaller
+
+      - name: Run tests
+        run: python3 -m pytest tests.py -q
+
+      - name: Build .app
+        run: |
+          pyinstaller \
+            --windowed \
+            --name "CurlClient" \
+            --clean \
+            curl_client.py
+
+      - name: Package .dmg
+        run: |
+          mkdir -p dist/dmg
+          cp -r "dist/CurlClient.app" dist/dmg/
+          hdiutil create \
+            -volname "CurlClient" \
+            -srcfolder dist/dmg \
+            -ov -format UDZO \
+            "dist/CurlClient-macOS.dmg"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CurlClient-macOS.dmg
