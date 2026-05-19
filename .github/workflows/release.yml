@@ -19,7 +19,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests pyinstaller
+        run: pip install requests pyinstaller pytest
 
       - name: Run tests
         run: python -m pytest tests.py -q
@@ -42,7 +42,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip3 install requests pyinstaller
+        run: pip3 install requests pyinstaller pytest
 
       - name: Run tests
         run: python3 -m pytest tests.py -q
